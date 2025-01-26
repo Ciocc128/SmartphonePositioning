@@ -1,0 +1,24 @@
+[Random Forest] Cross-Validation Accuracy: 0.1731 ± 0.0020
+
+Classification Report:
+              precision    recall  f1-score   support
+
+           0       1.00      1.00      1.00     21525
+           1       1.00      1.00      1.00     21492
+           2       1.00      1.00      1.00     21492
+           3       1.00      1.00      1.00     20777
+           4       1.00      1.00      1.00     20635
+           5       1.00      1.00      1.00     20190
+
+    accuracy                           1.00    126111
+   macro avg       1.00      1.00      1.00    126111
+weighted avg       1.00      1.00      1.00    126111
+
+
+Confusion Matrix:
+[[21525     0     0     0     0     0]
+ [    0 21492     0     0     0     0]
+ [    0     0 21492     0     0     0]
+ [    0     0     0 20777     0     0]
+ [    0     0     0     0 20635     0]
+ [    0     0     0     0     0 20190]]
