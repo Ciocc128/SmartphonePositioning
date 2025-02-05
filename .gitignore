@@ -7,3 +7,10 @@ mlruns/
 mlartifacts/
 tf-venv/
 .DS_Store
+
+# Ignora modelli troppo grandi
+src/modeling/models/baseline2/
+src/modeling/models/baseline/
+
+# Ignora l'ambiente virtuale
+tf-venv/
