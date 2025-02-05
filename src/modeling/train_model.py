@@ -8,6 +8,7 @@ import time
 import joblib
 import os
 import copy
+import pickle
 from tqdm import tqdm
 from xgboost import XGBClassifier
 import tensorflow as tf
@@ -61,115 +62,189 @@ def create_ann(input_dim, num_classes):
     model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     return model
 
-# Step 4: Training e validazione basata sui soggetti
-def train_and_evaluate_models(models, X, y, subjects, save_dir, log_dir):
-    """Allena e valuta diversi modelli con cross-validation basata sui soggetti, salva i pesi e le metriche."""
-    # Assicurati che le directory di salvataggio esistano
-    os.makedirs(save_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
+# Step 4: Gestione dei fold di GroupKFold
+def save_folds(X, y, subjects, n_splits=5, save_path="modeling/fold_indices.pkl"):
+    """Genera e salva gli indici di GroupKFold per garantire suddivisioni consistenti tra esperimenti."""
+    group_kfold = GroupKFold(n_splits=n_splits)
+    folds = list(group_kfold.split(X, y, groups=subjects))
+    with open(save_path, "wb") as f:
+        pickle.dump(folds, f)
+    print(f"Folds salvati in {save_path}")
 
-    group_kfold = GroupKFold(n_splits=5)
-    total_models = len(models)
-    with tqdm(total=total_models, desc="Training modelli") as pbar:
-        for idx, (name, model) in enumerate(models.items(), start=1):
-            print(f"\n[{idx}/{total_models}] Inizio allenamento modello: {name}")
-            start_time = time.time()
-            cv_scores = []
+def load_folds(load_path="modeling/fold_indices.pkl"):
+    """Carica gli indici salvati di GroupKFold."""
+    try:
+        with open(load_path, "rb") as f:
+            folds = pickle.load(f)
+        print(f"Folds caricati da {load_path}")
+        return folds
+    except FileNotFoundError:
+        print(f"Errore: Il file {load_path} non esiste.")
+        return None
 
-            if name == 'ANN':
-                # Specifico per ANN: dividere in training e validation set per soggetti
-                for train_idx, val_idx in group_kfold.split(X, y, groups=subjects):
-                    X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-                    y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+def manage_folds(X, y, subjects, n_splits=5, save_path="modeling/fold_indices.pkl"):
+    """Gestisce il caricamento o la generazione dei fold."""
+    folds = load_folds(load_path=save_path)
+    if folds is None:
+        save_folds(X, y, subjects, n_splits=n_splits, save_path=save_path)
+        folds = load_folds(load_path=save_path)
+    return folds
 
-                    early_stopping = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
-                    history = model.fit(
-                        X_train, y_train,
-                        validation_data=(X_val, y_val),
-                        epochs=50,
-                        batch_size=256,
-                        callbacks=[early_stopping],
-                        verbose=1
+# Step 5: Training e validazione basata sui soggetti
+def train_and_evaluate_single_model(model_name, models, X, y, subjects, logs_dir, models_dir, pipeline_name, experiment_name, folds, use_early_stopping=True):
+    """Allena e valuta un singolo modello con cross-validation basata sui soggetti, salva i pesi e le metriche."""
+    # Creazione delle directory pipeline e esperimento
+    pipeline_logs_dir = os.path.join(logs_dir, pipeline_name, experiment_name)
+    pipeline_models_dir = os.path.join(models_dir, pipeline_name, experiment_name)
+    os.makedirs(pipeline_logs_dir, exist_ok=True)
+    os.makedirs(pipeline_models_dir, exist_ok=True)
+
+    # Salva iperparametri nel file dell'esperimento
+    hyperparams_path = os.path.join(pipeline_logs_dir, "hyperparameters.txt")
+    with open(hyperparams_path, "w") as f:
+        f.write(f"Model: {model_name}\n")
+        if model_name == 'ANN':
+            f.write("ANN Hyperparameters:\n")
+            f.write(" - Layers: [128, 64, num_classes]\n")
+            f.write(" - Activation: relu\n")
+            f.write(" - Optimizer: adam\n")
+            f.write(" - Loss: sparse_categorical_crossentropy\n")
+            f.write(" - Batch size: 256\n")
+            f.write(" - Early stopping: {use_early_stopping}\n")
+        else:
+            f.write(f"Hyperparameters: {models[model_name].get_params()}\n")
+
+    print(f"\nInizio allenamento modello: {model_name}")
+    start_time = time.time()
+    cv_scores = []
+    all_reports = []
+
+    if model_name == 'ANN':
+        # Specifico per ANN: dividere in training e validation set per soggetti
+        for fold_idx, (train_idx, val_idx) in enumerate(tqdm(folds, desc="Cross-validation folds")):
+            # Ricrea il modello per ogni fold
+            model = create_ann(X.shape[1], len(np.unique(y)))
+
+            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+            callbacks = []
+            if use_early_stopping:
+                callbacks.append(EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True))
+
+            history = model.fit(
+                X_train, y_train,
+                validation_data=(X_val, y_val),
+                epochs=50,
+                batch_size=256,
+                callbacks=callbacks,
+                verbose=1
+            )
+
+            # Salva la storia dell'allenamento
+            log_path = os.path.join(pipeline_logs_dir, f"{model_name.replace(' ', '_').lower()}_training_history_fold_{fold_idx}.log")
+            with open(log_path, "w") as log_file:
+                for epoch, (train_loss, val_loss, val_acc) in enumerate(zip(
+                    history.history['loss'],
+                    history.history['val_loss'],
+                    history.history.get('val_accuracy', [])
+                )):
+                    log_file.write(
+                        f"Epoch {epoch+1}: Training Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_acc:.4f}\n"
                     )
 
-                    # Salva la storia dell'allenamento
-                    log_path = os.path.join(log_dir, f"{name.replace(' ', '_').lower()}_training_history.log")
-                    with open(log_path, "w") as log_file:
-                        for epoch, (train_loss, val_loss, val_acc) in enumerate(zip(
-                            history.history['loss'],
-                            history.history['val_loss'],
-                            history.history.get('val_accuracy', [])
-                        )):
-                            log_file.write(
-                                f"Epoch {epoch+1}: Training Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_acc:.4f}\n"
-                            )
+            # Valutare il modello sul validation set
+            score = model.evaluate(X_val, y_val, verbose=0)[1]  # Accuracy
+            cv_scores.append(score)
 
-                    # Valutare il modello sul validation set
-                    score = model.evaluate(X_val, y_val, verbose=0)[1]  # Accuracy
-                    cv_scores.append(score)
+            # Calcola e stampa le metriche finali
+            y_pred = model.predict(X_val)
+            y_pred_classes = np.argmax(y_pred, axis=1)
+            report = classification_report(y_val, y_pred_classes)
+            matrix = confusion_matrix(y_val, y_pred_classes)
+            print(f"Classification Report:\n{report}")
+            print(f"Confusion Matrix:\n{matrix}")
 
-                    # Calcola e stampa le metriche finali
-                    y_pred = model.predict(X_val)
-                    y_pred_classes = np.argmax(y_pred, axis=1)
-                    report = classification_report(y_val, y_pred_classes)
-                    matrix = confusion_matrix(y_val, y_pred_classes)
-                    print(f"Classification Report:\n{report}")
-                    print(f"Confusion Matrix:\n{matrix}")
+            # Soggetti per il fold corrente
+            train_subjects = subjects.iloc[train_idx].unique()
+            val_subjects = subjects.iloc[val_idx].unique()
 
-                    # Salva nel log file
-                    final_log_path = os.path.join(log_dir, f"{name.replace(' ', '_').lower()}_final_metrics.log")
-                    with open(final_log_path, "w") as log_file:
-                        log_file.write(f"Classification Report:\n{report}\n")
-                        log_file.write(f"Confusion Matrix:\n{matrix}\n")
+            # Aggiungi al report complessivo
+            all_reports.append(f"Fold {fold_idx + 1} Train Subjects:\n{train_subjects}\n")
+            all_reports.append(f"Fold {fold_idx + 1} Validation Subjects:\n{val_subjects}\n")
+            all_reports.append(f"Fold {fold_idx + 1} Classification Report:\n{report}\n")
+            all_reports.append(f"Fold {fold_idx + 1} Confusion Matrix:\n{matrix}\n")
 
-                # Salva i pesi dell'ANN
-                ann_model_filename = os.path.join(save_dir, f"baseline_{name.lower()}.h5")
-                model.save(ann_model_filename)
-                print(f"[{name}] Modello salvato in {ann_model_filename}")
+        # Salva il report complessivo in un unico file
+        combined_report_path = os.path.join(pipeline_logs_dir, "final_metrics.log")
+        with open(combined_report_path, "w") as report_file:
+            report_file.write("\n".join(all_reports))
 
-            else:
-                # Cross-validation per gli altri modelli
-                for train_idx, test_idx in group_kfold.split(X, y, groups=subjects):
-                    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-                    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        # Stampa e salva la Cross-Validation Accuracy
+        print(f"[{model_name}] Cross-Validation Accuracy: {np.mean(cv_scores):.4f} ± {np.std(cv_scores):.4f}")
+        with open(combined_report_path, "a") as report_file:
+            report_file.write(f"\n[{model_name}] Cross-Validation Accuracy: {np.mean(cv_scores):.4f} ± {np.std(cv_scores):.4f}\n")
 
-                    model.fit(X_train, y_train)
-                    y_pred = model.predict(X_test)
-                    score = model.score(X_test, y_test)
-                    cv_scores.append(score)
+        # Salva i pesi dell'ANN
+        ann_model_filename = os.path.join(pipeline_models_dir, f"baseline2_{model_name.lower()}.h5")
+        model.save(ann_model_filename)
+        print(f"[{model_name}] Modello salvato in {ann_model_filename}")
 
-                    # Calcola e stampa le metriche
-                    report = classification_report(y_test, y_pred)
-                    matrix = confusion_matrix(y_test, y_pred)
-                    print(f"Classification Report:\n{report}")
-                    print(f"Confusion Matrix:\n{matrix}")
+    else:
+        # Cross-validation per gli altri modelli
+        for fold_idx, (train_idx, test_idx) in enumerate(tqdm(folds, desc="Cross-validation folds")):
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-                    # Salva nel log file
-                    log_path = os.path.join(log_dir, f"{name.replace(' ', '_').lower()}_metrics.log")
-                    with open(log_path, "a") as log_file:
-                        log_file.write(f"Classification Report:\n{report}\n")
-                        log_file.write(f"Confusion Matrix:\n{matrix}\n")
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            score = model.score(X_test, y_test)
+            cv_scores.append(score)
 
-            print(f"[{name}] Cross-Validation Accuracy: {np.mean(cv_scores):.4f} ± {np.std(cv_scores):.4f}")
+            # Calcola e stampa le metriche
+            report = classification_report(y_test, y_pred)
+            matrix = confusion_matrix(y_test, y_pred)
+            print(f"Classification Report:\n{report}")
+            print(f"Confusion Matrix:\n{matrix}")
 
-            # Salva il modello allenato sull'ultimo fold
-            if name != 'ANN':
-                model_filename = os.path.join(save_dir, f"baseline_{name.replace(' ', '_').lower()}.joblib")
-                joblib.dump(model, model_filename)
-                print(f"[{name}] Modello salvato in {model_filename}")
+            # Soggetti per il fold corrente
+            train_subjects = subjects.iloc[train_idx].unique()
+            val_subjects = subjects.iloc[val_idx].unique()
 
-            elapsed_time = time.time() - start_time
-            print(f"[{name}] Modello completato in {elapsed_time:.2f} secondi.")
+            # Aggiungi al report complessivo
+            all_reports.append(f"Fold {fold_idx + 1} Train Subjects:\n{train_subjects}\n")
+            all_reports.append(f"Fold {fold_idx + 1} Validation Subjects:\n{val_subjects}\n")
+            all_reports.append(f"Fold {fold_idx + 1} Classification Report:\n{report}\n")
+            all_reports.append(f"Fold {fold_idx + 1} Confusion Matrix:\n{matrix}\n")
 
-            # Avanza la barra di progresso
-            pbar.update(1)
+        # Salva il report complessivo in un unico file
+        combined_report_path = os.path.join(pipeline_logs_dir, "final_metrics.log")
+        with open(combined_report_path, "w") as report_file:
+            report_file.write("\n".join(all_reports))
+
+        # Stampa e salva la Cross-Validation Accuracy
+        print(f"[{model_name}] Cross-Validation Accuracy: {np.mean(cv_scores):.4f} ± {np.std(cv_scores):.4f}")
+        with open(combined_report_path, "a") as report_file:
+            report_file.write(f"\n[{model_name}] Cross-Validation Accuracy: {np.mean(cv_scores):.4f} ± {np.std(cv_scores):.4f}\n")
+
+        # Salva il modello allenato sull'ultimo fold
+        model_filename = os.path.join(pipeline_models_dir, f"baseline2_{model_name.replace(' ', '_').lower()}.joblib")
+        joblib.dump(model, model_filename)
+        print(f"[{model_name}] Modello salvato in {model_filename}")
+
+    elapsed_time = time.time() - start_time
+    print(f"[{model_name}] Modello completato in {elapsed_time:.2f} secondi.")
 
 # Main
 if __name__ == "__main__":
     # Specifica il percorso del file CSV
-    data_file = "/Volumes/Mac/DatasetSP/preprocessed/feature_selected/dataset_with_pcs_train.csv"
-    save_dir = "models/baseline"  # Percorso per salvare i modelli
-    log_dir = "logs/baseline"  # Percorso per salvare i log
+    data_file = "/Volumes/Mac/DatasetSP/feature engineering/feature_selected/dataset_with_pcs_train.csv"
+    modeling_dir = "/Users/giorgio/Desktop/SmartphonePositioning/src/modeling"  # Cartella madre per il modeling
+    logs_dir = os.path.join(modeling_dir, "logs")  # Cartella madre per i log
+    models_dir = os.path.join(modeling_dir, "models" ) # Cartella madre per i modelli
+
+    pipeline_name = "baseline2"  # Nome della pipeline
+    experiment_name = "ann_no_ES"  # Nome dell'esperimento
 
     # Caricamento e preprocessing dei dati
     print("Caricamento del dataset...")
@@ -187,7 +262,21 @@ if __name__ == "__main__":
     models = create_models(input_dim, num_classes)
     print("Modelli creati!")
 
-    # Training e validazione
-    print("Inizio del training e della validazione...")
-    train_and_evaluate_models(models, X, y, subjects, save_dir, log_dir)
-    print("Training e validazione completati!")
+    # Gestione dei fold
+    fold_path = os.path.join(modeling_dir, "fold_indices.pkl")
+    folds = manage_folds(X, y, subjects, save_path=fold_path)
+
+    # Selezione del modello da allenare
+    selected_model = "ANN"  # Modifica questo valore per selezionare un modello specifico o "ALL" per allenarli tutti
+
+    use_early_stopping = False  # Modifica questo valore per abilitare/disabilitare l'early stopping nell'ANN
+
+    if selected_model == "ALL":
+        for model_name in models.keys():
+            print(f"Inizio del training e della validazione per il modello: {model_name}...")
+            train_and_evaluate_single_model(model_name, models, X, y, subjects, logs_dir, models_dir, pipeline_name, experiment_name, folds, use_early_stopping)
+            print(f"Training e validazione completati per il modello: {model_name}!")
+    else:
+        print(f"Inizio del training e della validazione per il modello selezionato: {selected_model}...")
+        train_and_evaluate_single_model(selected_model, models, X, y, subjects, logs_dir, models_dir, pipeline_name, experiment_name, folds, use_early_stopping)
+        print(f"Training e validazione completati per il modello: {selected_model}!")

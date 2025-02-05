@@ -151,14 +151,16 @@ from tsfresh import extract_features
 from tqdm import tqdm
 import os
 
+
 if __name__ == "__main__":
 
     # Caricamento del dataset
     print("Caricamento del dataset...")
-    output_path = "/Volumes/Mac/DatasetSP/preprocessed"
-    os.makedirs(output_path, exist_ok=True)
+    output_path = "/Volumes/Mac/DatasetSP/pipeline1"
+    partial_output_path = os.path.join(output_path, "partial_batches")
+    os.makedirs(partial_output_path, exist_ok=True)
 
-    df = pd.read_csv("/Volumes/Mac/DatasetSP/preprocessed/combined_dataset.csv")
+    df = pd.read_csv("/Volumes/Mac/DatasetSP/pipeline1/filtered_dataset.csv")
     print(f"Dataset caricato con {len(df)} campioni.")
 
     # 1. Riordina il dataset
@@ -166,110 +168,160 @@ if __name__ == "__main__":
     df = df.sort_values(by=["Subject", "Test", "Trial", "Bout", "Position", "Sensor"]).reset_index(drop=True)
     print("Dataset riordinato.")
 
+    # 2. Segmenta il dataset bout per bout
+    grouped = df.groupby(["Subject", "Test", "Trial", "Bout", "Position"])
+
+    # Contatori per campioni esclusi
+    total_excluded_samples = 0
+    small_bout_excluded_samples = 0
+    leftover_excluded_samples = 0
+
     # Funzione per segmentare un gruppo in finestre
-    def segment_bout(group, window_size=100):
+    def segment_sensors(group, window_size=100):
         """
-        Segmenta un gruppo (bout) in finestre temporali per accelerometro e giroscopio,
-        mantenendo la coerenza temporale.
+        Segmenta un gruppo (bout) in finestre separate per accelerometro e giroscopio,
+        allineando temporalmente i dati.
         """
-        acc_data = group[group["Sensor"] == 1].copy()
-        gyr_data = group[group["Sensor"] == 2].copy()
+        global total_excluded_samples, small_bout_excluded_samples, leftover_excluded_samples
+
+        # Separiamo accelerometro e giroscopio
+        acc_data = group[group["Sensor"] == 1]
+        gyr_data = group[group["Sensor"] == 2]
         
+        num_acc_samples = len(acc_data)
+        num_gyr_samples = len(gyr_data)
+
+        # Gestione bout troppo piccoli
+        if num_acc_samples < window_size or num_gyr_samples < window_size:
+            small_bout_excluded_samples += num_acc_samples + num_gyr_samples
+            total_excluded_samples += num_acc_samples + num_gyr_samples
+            return [], []
+        
+        # Calcolo dei campioni esclusi dalla finestratura
+        acc_leftover = num_acc_samples % window_size
+        gyr_leftover = num_gyr_samples % window_size
+        leftover_excluded_samples += acc_leftover + gyr_leftover
+        total_excluded_samples += acc_leftover + gyr_leftover
+
         # Segmentazione per accelerometro
         acc_segments = [
             acc_data.iloc[i:i+window_size]
-            for i in range(0, len(acc_data) - window_size + 1, window_size)
+            for i in range(0, num_acc_samples - acc_leftover, window_size)
         ]
         
         # Segmentazione per giroscopio
         gyr_segments = [
             gyr_data.iloc[i:i+window_size]
-            for i in range(0, len(gyr_data) - window_size + 1, window_size)
+            for i in range(0, num_gyr_samples - gyr_leftover, window_size)
         ]
         
         return acc_segments, gyr_segments
 
-    # Raggruppa i dati per bout
-    grouped = df.groupby(["Subject", "Test", "Trial", "Bout", "Position"])
-
-    # Creazione del dataset finale
+    # Lista per salvare tutte le finestre e i metadati
     all_segments = []
     metadata = []
 
-    print("Segmentazione e batching dei dati...")
+    # Contatore di segmenti temporali
+    segment_counter = 0
+
+    # Itera su ogni bout
+    print("Segmentazione dei gruppi...")
     for (subject, test, trial, bout, position), group in tqdm(grouped, desc="Processando gruppi"):
-        acc_segments, gyr_segments = segment_bout(group)
+        # Segmenta accelerometro e giroscopio
+        acc_segments, gyr_segments = segment_sensors(group)
         
-        for i, (acc_segment, gyr_segment) in enumerate(zip(acc_segments, gyr_segments)):
+        # Combina le finestre
+        for acc_segment, gyr_segment in zip(acc_segments, gyr_segments):
+            # Calcola la norma triassiale
+            acc_segment = acc_segment.copy()
             acc_segment["Norm"] = np.sqrt(acc_segment["X"]**2 + acc_segment["Y"]**2 + acc_segment["Z"]**2)
+
+            gyr_segment = gyr_segment.copy()
             gyr_segment["Norm"] = np.sqrt(gyr_segment["X"]**2 + gyr_segment["Y"]**2 + gyr_segment["Z"]**2)
-            
-            # Prepara il batch con id coerenti
-            all_segments.append({
-                "Acc": acc_segment,
-                "Gyr": gyr_segment,
-                "Meta": {
-                    "Subject": subject,
-                    "Test": test,
-                    "Trial": trial,
-                    "Bout": bout,
-                    "Position": position,
-                    "Segment_Index": i
-                }
+
+            all_segments.append({"Acc": acc_segment, "Gyr": gyr_segment})
+            metadata.append({
+                "Subject": subject,
+                "Test": test,
+                "Trial": trial,
+                "Bout": bout,
+                "Position": position
             })
 
-    print(f"Segmentazione completata. Numero totale di segmenti: {len(all_segments)}")
+            # Incrementa il contatore di segmenti
+            segment_counter += 1
 
-    # Estrazione delle feature in batch
-    print("Estrazione delle feature con TSFresh...")
-    batch_size = 1000  # Numero di segmenti per batch
+    print(f"Segmentazione completata. Numero totale di segmenti: {len(all_segments)}")
+    print(f"Numero totale di segmenti calcolati dal contatore: {segment_counter}")
+    print(f"Campioni esclusi per bout troppo piccoli: {small_bout_excluded_samples}")
+    print(f"Campioni esclusi come avanzati dalla finestratura: {leftover_excluded_samples}")
+    print(f"Totale campioni esclusi: {total_excluded_samples}")
+
+    # Creazione di batch a livello di finestra temporale
+    print("Creazione di batch a livello di finestra temporale...")
+    batch_size = 1000  # Numero di finestre temporali per batch
+    batches = [
+        all_segments[i:i + batch_size]
+        for i in range(0, len(all_segments), batch_size)
+    ]
+
+    # Estrai le feature con TSFresh e combina accelerometro e giroscopio
+    print("Estrazione delle feature con TSFresh in batch...")
     combined_features = []
 
-    for batch_start in tqdm(range(0, len(all_segments), batch_size), desc="Processando batch"):
-        batch_end = min(batch_start + batch_size, len(all_segments))
-        batch_segments = all_segments[batch_start:batch_end]
-
+    for batch_idx, batch_segments in tqdm(enumerate(batches), desc="Processando batch", total=len(batches)):
         ts_data = []
-        meta_data = []
-        for segment in batch_segments:
-            acc_data = segment["Acc"]
-            gyr_data = segment["Gyr"]
-            meta = segment["Meta"]
-
-            acc_data["id"] = f"{meta['Subject']}_{meta['Test']}_{meta['Trial']}_{meta['Bout']}_acc_{meta['Segment_Index']}"
-            gyr_data["id"] = f"{meta['Subject']}_{meta['Test']}_{meta['Trial']}_{meta['Bout']}_gyr_{meta['Segment_Index']}"
-            
+        for idx, segment_pair in enumerate(batch_segments):
+            acc_data = segment_pair["Acc"].copy()
+            acc_data["id"] = f"{batch_idx}_{idx}_acc"
             acc_data["value"] = acc_data["Norm"]
+
+            gyr_data = segment_pair["Gyr"].copy()
+            gyr_data["id"] = f"{batch_idx}_{idx}_gyr"
             gyr_data["value"] = gyr_data["Norm"]
 
             ts_data.append(acc_data[["id", "value"]])
             ts_data.append(gyr_data[["id", "value"]])
-            meta_data.append(meta)
 
         ts_data = pd.concat(ts_data, ignore_index=True)
 
-        # Estrai le feature con TSFresh
+        # Estrai le feature per il batch
         features = extract_features(ts_data, column_id="id", column_value="value")
 
-        # Dividi e combina le feature
-        acc_features = features.filter(like="_acc").add_prefix("Acc_")
-        gyr_features = features.filter(like="_gyr").add_prefix("Gyr_")
+        # Filtra le righe per accelerometro e giroscopio
+        acc_features = features[features.index.str.contains("_acc")]
+        gyr_features = features[features.index.str.contains("_gyr")]
 
-        combined_batch = pd.concat([acc_features, gyr_features], axis=1).reset_index(drop=True)
-        combined_features.append((pd.DataFrame(meta_data), combined_batch))
+        # Combina le feature di accelerometro e giroscopio in un'unica riga per segmento
+        combined_batch = []
+        for acc_id, acc_row in acc_features.iterrows():
+            gyr_id = acc_id.replace("_acc", "_gyr")
+            if gyr_id in gyr_features.index:
+                combined_row = pd.concat([acc_row.add_prefix("Acc_"), gyr_features.loc[gyr_id].add_prefix("Gyr_")])
+                combined_batch.append(combined_row)
+
+        # Aggiungi il batch combinato solo se contiene dati
+        if combined_batch:
+            combined_features.append(pd.DataFrame(combined_batch))
 
     print("Combinazione completata.")
 
-    # Combina i batch finali
+    # Verifica del numero di righe atteso
+    combined_total_rows = sum(len(batch) for batch in combined_features)
+    print(f"Numero totale di righe combinate: {combined_total_rows}. Dovrebbe essere circa la metà delle righe originali.")
+    print(f"Numero totale di segmenti calcolati dal contatore: {segment_counter}")
+    print(f"Campioni esclusi per bout troppo piccoli: {small_bout_excluded_samples}")
+    print(f"Campioni esclusi come avanzati dalla finestratura: {leftover_excluded_samples}")
+    print(f"Totale campioni esclusi: {total_excluded_samples}")
+
+    # Crea il DataFrame finale
     print("Creazione del DataFrame finale...")
-    metadata_df = pd.concat([meta for meta, _ in combined_features], ignore_index=True)
-    feature_df = pd.concat([features for _, features in combined_features], ignore_index=True)
-    final_df = pd.concat([metadata_df, feature_df], axis=1)
+    meta_df = pd.DataFrame(metadata)
+    final_features = pd.concat(combined_features, ignore_index=True)
+    final_df = pd.concat([meta_df, final_features], axis=1)
 
-    # Esporta il dataset
+    # Esporta il dataset finale
     print("Esportazione del dataset finale...")
-    output_file_path = os.path.join(output_path, "combined_features.csv")
+    output_file_path = os.path.join(output_path, "combined_features_1.csv")
     final_df.to_csv(output_file_path, index=False)
-    print("Esportazione completata. Dataset salvato come 'combined_features.csv'.")
-
-
+    print("Esportazione completata. Dataset salvato come 'combined_features_1.csv'.")

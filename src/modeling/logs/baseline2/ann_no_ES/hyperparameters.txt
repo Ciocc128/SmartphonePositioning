@@ -1,0 +1,8 @@
+Model: ANN
+ANN Hyperparameters:
+ - Layers: [128, 64, num_classes]
+ - Activation: relu
+ - Optimizer: adam
+ - Loss: sparse_categorical_crossentropy
+ - Batch size: 256
+ - Early stopping: {use_early_stopping}

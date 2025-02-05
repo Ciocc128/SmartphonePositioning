@@ -2,3 +2,8 @@ __pycache__/
 *.ipynb_checkpoints/
 *.csv
 *.log
+# Ignora i risultati delle pipeline MLflow
+mlruns/
+mlartifacts/
+tf-venv/
+.DS_Store
